@@ -1,13 +1,14 @@
 {
   "Name": "Mana Barrier Mod",
   "Author": "ACE",
-  "Description": "Splits incoming player damage between health and mana for characters with specialized Mana Conversion and specialized War Magic or Void Magic.",
+  "Description": "Gives qualifying characters a skill-based chance to route incoming damage to mana.",
   "Version": "1.0.0",
   "Priority": 0,
   "Enabled": true,
   "HotReload": true,
   "RegisterCommands": true,
-  "MaximumManaSurcharge": 1.00,
-  "MinimumManaSurcharge": 0.05,
-  "SkillTotalForMinimumSurcharge": 993.0
+  "MaximumMitigationChance": 0.75,
+  "MinimumMitigationChance": 0.05,
+  "OverchargeMitigationBonus": 0.25,
+  "SkillTotalForMaximumMitigationChance": 993.0
 }

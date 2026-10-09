@@ -1,17 +1,16 @@
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using HarmonyLib;
 using log4net;
 
 using ACE.Common;
-using ACE.Entity;
 using ACE.Entity.Enum;
 using ACE.Server.Command;
 using ACE.Server.Entity;
 using ACE.Server.Mods;
 using ACE.Server.Network;
-using ACE.Server.Network.Enum;
 using ACE.Server.WorldObjects;
 
 namespace ManaBarrierMod
@@ -19,6 +18,8 @@ namespace ManaBarrierMod
     public sealed class Mod : IHarmonyMod
     {
         private static readonly ILog log = LogManager.GetLogger(typeof(Mod));
+        private static readonly ConditionalWeakTable<Player, OverchargeState> overchargeStates =
+            new ConditionalWeakTable<Player, OverchargeState>();
 
         private static ManaBarrierSettings settings;
 
@@ -48,17 +49,18 @@ namespace ManaBarrierMod
                 takeDamageMethod,
                 prefix: new HarmonyMethod(typeof(Mod), nameof(PlayerTakeDamagePrefix)));
 
-            var takeDamageOverTimeMethod = AccessTools.Method(
-                typeof(Player),
-                nameof(Player.TakeDamageOverTime),
-                new[] { typeof(float), typeof(DamageType) });
+            var calculateManaUsageMethod = AccessTools.Method(
+                typeof(Creature),
+                nameof(Creature.CalculateManaUsage),
+                new[] { typeof(Creature), typeof(Spell), typeof(WorldObject) });
 
-            if (takeDamageOverTimeMethod == null)
-                throw new MissingMethodException("Could not find the player periodic damage method.");
+            if (calculateManaUsageMethod == null)
+                throw new MissingMethodException("Could not find the spell mana usage method.");
 
             harmony.Patch(
-                takeDamageOverTimeMethod,
-                prefix: new HarmonyMethod(typeof(Mod), nameof(PlayerTakeDamageOverTimePrefix)));
+                calculateManaUsageMethod,
+                postfix: new HarmonyMethod(typeof(Mod), nameof(CalculateManaUsagePostfix)));
+
         }
 
         public void Dispose()
@@ -80,14 +82,17 @@ namespace ManaBarrierMod
             if (loadedSettings == null)
                 throw new InvalidDataException($"Could not load Mana Barrier settings from {metadataPath}.");
 
-            if (loadedSettings.MaximumManaSurcharge < loadedSettings.MinimumManaSurcharge ||
-                loadedSettings.MinimumManaSurcharge < 0 ||
-                loadedSettings.SkillTotalForMinimumSurcharge <= 0)
+            if (loadedSettings.MaximumMitigationChance < loadedSettings.MinimumMitigationChance ||
+                loadedSettings.MinimumMitigationChance < 0 ||
+                loadedSettings.MaximumMitigationChance > 1 ||
+                loadedSettings.OverchargeMitigationBonus < 0 ||
+                loadedSettings.OverchargeMitigationBonus > 1 ||
+                loadedSettings.SkillTotalForMaximumMitigationChance <= 0)
             {
                 throw new InvalidDataException(
-                    "Mana Barrier settings must have a non-negative minimum surcharge, " +
-                    "a maximum surcharge greater than or equal to the minimum, and a positive " +
-                    "skill total for the minimum surcharge.");
+                    "Mana Barrier settings must have mitigation chances and overcharge bonus between 0 and 1, " +
+                    "a maximum chance greater than or equal to the minimum, and a positive " +
+                    "skill total for the maximum chance.");
             }
 
             return loadedSettings;
@@ -95,18 +100,36 @@ namespace ManaBarrierMod
 
         private static void PlayerTakeDamagePrefix(
             Player __instance,
+            WorldObject source,
             DamageType damageType,
             ref float _amount)
         {
+            if (!IsPhysicalAttack(source))
+                return;
+
             ApplyManaBarrier(__instance, damageType, ref _amount);
         }
 
-        private static void PlayerTakeDamageOverTimePrefix(
-            Player __instance,
-            DamageType damageType,
-            ref float _amount)
+        private static void CalculateManaUsagePostfix(Creature caster, ref uint __result)
         {
-            ApplyManaBarrier(__instance, damageType, ref _amount);
+            if (!(caster is Player player) || !IsOverchargeEnabled(player))
+                return;
+
+            __result = __result > uint.MaxValue / 2
+                ? uint.MaxValue
+                : __result * 2;
+        }
+
+        private static bool IsPhysicalAttack(WorldObject source)
+        {
+            if (!(source is Creature attacker))
+                return false;
+
+            if (attacker is Player player && player.CombatMode == CombatMode.Magic)
+                return false;
+
+            return attacker.GetCombatType() == CombatType.Melee ||
+                attacker.GetCombatType() == CombatType.Missile;
         }
 
         private static void ApplyManaBarrier(Player player, DamageType damageType, ref float amount)
@@ -123,50 +146,51 @@ namespace ManaBarrierMod
             if (incomingDamage == 0)
                 return;
 
-            // Split damage evenly, assigning the odd point to mana. The mana share
-            // then receives a surcharge that is reduced by the combined Mana
-            // Conversion and Assess Creature skill totals.
-            var calculatedHealthDamage = incomingDamage / 2;
-            var calculatedManaDamage = incomingDamage - calculatedHealthDamage;
+            // Mana is only an eligibility check. If the player cannot cover the
+            // entire hit, leave the amount unchanged and let ACE apply normal damage.
+            if (player.Mana.Current < incomingDamage)
+                return;
+
             var effectiveManaConversion = GetEffectiveManaConversion(player);
             var assessCreature = GetAssessCreatureValue(player);
             var combinedSkillTotal = effectiveManaConversion + assessCreature;
-            var skillProgress = Math.Min(1.0, combinedSkillTotal / settings.SkillTotalForMinimumSurcharge);
-            var manaSurcharge = settings.MaximumManaSurcharge -
-                (settings.MaximumManaSurcharge - settings.MinimumManaSurcharge) * skillProgress;
-            var requestedManaDamage = (uint)Math.Min(
-                uint.MaxValue,
-                Math.Ceiling(calculatedManaDamage * (1.0 + manaSurcharge)));
-            var manaDamage = Math.Min(requestedManaDamage, player.Mana.Current);
-            var unabsorbedManaDamage = requestedManaDamage > manaDamage
-                ? requestedManaDamage - manaDamage
-                : 0;
-            var healthDamage = calculatedHealthDamage + unabsorbedManaDamage;
+            var skillProgress = Math.Min(
+                1.0,
+                combinedSkillTotal / settings.SkillTotalForMaximumMitigationChance);
+            var mitigationChance = settings.MinimumMitigationChance +
+                (settings.MaximumMitigationChance - settings.MinimumMitigationChance) * skillProgress;
+            var roll = ThreadSafeRandom.Next(0.0f, 1.0f);
+
+            if (roll >= mitigationChance)
+            {
+                log.Debug(
+                    $"[ManaBarrier] Player={player.Name} Guid={player.Guid} " +
+                    $"Incoming={incomingDamage} ManaConversion={effectiveManaConversion} " +
+                    $"AssessCreature={assessCreature} CombinedSkill={combinedSkillTotal} " +
+                    $"SkillProgress={skillProgress:0.####} MitigationChance={mitigationChance:P2} " +
+                    $"Roll={roll:0.####} Mitigated=False.");
+                return;
+            }
 
             log.Debug(
                 $"[ManaBarrier] Player={player.Name} Guid={player.Guid} " +
                 $"Incoming={incomingDamage} ManaConversion={effectiveManaConversion} " +
                 $"AssessCreature={assessCreature} CombinedSkill={combinedSkillTotal} " +
-                $"SkillProgress={skillProgress:0.####} Surcharge={manaSurcharge:P2} " +
-                $"CalculatedHealth={calculatedHealthDamage} CalculatedMana={calculatedManaDamage} " +
-                $"RequestedMana={requestedManaDamage} CurrentMana={player.Mana.Current} " +
-                $"ActualMana={manaDamage} UnabsorbedMana={unabsorbedManaDamage} " +
-                $"HealthDamage={healthDamage}.");
+                $"SkillProgress={skillProgress:0.####} MitigationChance={mitigationChance:P2} " +
+                $"Roll={roll:0.####} Mitigated=True " +
+                $"CurrentMana={player.Mana.Current} ManaSpent=0 HealthDamage=0.");
 
-            if (manaDamage > 0)
-                player.UpdateVitalDelta(player.Mana, -(int)manaDamage);
-
-            amount = healthDamage;
+            amount = 0;
 
             player.SendMessage(
-                $"Mana Barrier absorbed {manaDamage} damage.",
+                $"Mana Barrier mitigated {incomingDamage} damage.",
                 ChatMessageType.Combat);
         }
 
         [CommandHandler("mb", AccessLevel.Player, CommandHandlerFlag.RequiresWorld, 0,
-            "Displays your current Mana Barrier surcharge.")]
+            "Displays your current Mana Barrier mitigation chance.")]
         [CommandHandler("manabarrier", AccessLevel.Player, CommandHandlerFlag.RequiresWorld, 0,
-            "Displays your current Mana Barrier surcharge.")]
+            "Displays your current Mana Barrier mitigation chance.")]
         public static void HandleManaBarrierStatus(Session session, params string[] parameters)
         {
             var player = session.Player;
@@ -186,25 +210,54 @@ namespace ManaBarrierMod
             var effectiveManaConversion = GetEffectiveManaConversion(player);
             var assessCreature = GetAssessCreatureValue(player);
             var combinedSkillTotal = effectiveManaConversion + assessCreature;
-            var surcharge = GetManaSurcharge(player) * 100.0;
+            var mitigationChance = GetMitigationChance(player) * 100.0;
+            var overchargeStatus = IsOverchargeEnabled(player) ? "Enabled" : "Disabled";
 
             player.SendMessage(
-                $"Mana Barrier surcharge: {surcharge:0.##}% | " +
+                $"Mana Barrier mitigation chance: {mitigationChance:0.##}% | " +
                 $"Mana Conversion: {baseManaConversion} (skill) x {wandManaConversionModifier:0.###} (wand modifier) = {effectiveManaConversion} | " +
-                $"Assess Creature: {assessCreature} | Combined: {combinedSkillTotal}.",
+                $"Assess Creature: {assessCreature} | Combined: {combinedSkillTotal} | " +
+                $"Overcharge: {overchargeStatus}.",
                 ChatMessageType.Broadcast);
         }
 
-        private static double GetManaSurcharge(Player player)
+        [CommandHandler("mboc", AccessLevel.Player, CommandHandlerFlag.RequiresWorld, 0,
+            "Toggles Mana Barrier overcharge.")]
+        [CommandHandler("manabarrierovercharge", AccessLevel.Player, CommandHandlerFlag.RequiresWorld, 0,
+            "Toggles Mana Barrier overcharge.")]
+        public static void HandleManaBarrierOvercharge(Session session, params string[] parameters)
+        {
+            var player = session.Player;
+            var state = overchargeStates.GetOrCreateValue(player);
+            state.Enabled = !state.Enabled;
+
+            var status = state.Enabled ? "enabled" : "disabled";
+            player.SendMessage(
+                $"Mana Barrier overcharge {status}. " +
+                (state.Enabled
+                    ? $"Mitigation chance increased by {settings.OverchargeMitigationBonus:P0}; spell mana costs are doubled."
+                    : "Mitigation chance and spell mana costs returned to normal."),
+                ChatMessageType.Broadcast);
+        }
+
+        private static double GetMitigationChance(Player player)
         {
             var combinedSkillTotal = GetCombinedSkillTotal(player);
 
             var skillProgress = Math.Min(
                 1.0,
-                combinedSkillTotal / settings.SkillTotalForMinimumSurcharge);
+                combinedSkillTotal / settings.SkillTotalForMaximumMitigationChance);
 
-            return settings.MaximumManaSurcharge -
-                (settings.MaximumManaSurcharge - settings.MinimumManaSurcharge) * skillProgress;
+            var mitigationChance = settings.MinimumMitigationChance +
+                (settings.MaximumMitigationChance - settings.MinimumMitigationChance) * skillProgress +
+                (IsOverchargeEnabled(player) ? settings.OverchargeMitigationBonus : 0);
+
+            return Math.Min(1.0, mitigationChance);
+        }
+
+        private static bool IsOverchargeEnabled(Player player)
+        {
+            return overchargeStates.TryGetValue(player, out var state) && state.Enabled;
         }
 
         private static uint GetEffectiveManaConversion(Player player)
@@ -237,6 +290,14 @@ namespace ManaBarrierMod
             if (!IsSpecialized(player, Skill.ManaConversion))
                 missingRequirements = "specialized Mana Conversion";
 
+            if (!IsUntrained(player, Skill.MeleeDefense))
+            {
+                if (missingRequirements.Length > 0)
+                    missingRequirements += " and ";
+
+                missingRequirements += "untrained Melee Defense";
+            }
+
             if (!IsSpecialized(player, Skill.WarMagic) &&
                 !IsSpecialized(player, Skill.VoidMagic))
             {
@@ -252,7 +313,14 @@ namespace ManaBarrierMod
         private static bool HasManaBarrierSkills(Player player)
         {
             return IsSpecialized(player, Skill.ManaConversion) &&
+                IsUntrained(player, Skill.MeleeDefense) &&
                 (IsSpecialized(player, Skill.WarMagic) || IsSpecialized(player, Skill.VoidMagic));
+        }
+
+        private static bool IsUntrained(Player player, Skill skill)
+        {
+            return player.Skills.TryGetValue(skill, out var creatureSkill) &&
+                creatureSkill.AdvancementClass == SkillAdvancementClass.Untrained;
         }
 
         private static bool IsSpecialized(Player player, Skill skill)
@@ -261,11 +329,17 @@ namespace ManaBarrierMod
                 creatureSkill.AdvancementClass == SkillAdvancementClass.Specialized;
         }
 
+        private sealed class OverchargeState
+        {
+            public bool Enabled { get; set; }
+        }
+
         private sealed class ManaBarrierSettings
         {
-            public double MaximumManaSurcharge { get; set; }
-            public double MinimumManaSurcharge { get; set; }
-            public double SkillTotalForMinimumSurcharge { get; set; }
+            public double MaximumMitigationChance { get; set; }
+            public double MinimumMitigationChance { get; set; }
+            public double OverchargeMitigationBonus { get; set; }
+            public double SkillTotalForMaximumMitigationChance { get; set; }
         }
     }
 }
