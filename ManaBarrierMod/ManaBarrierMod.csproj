@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>ManaBarrierMod</AssemblyName>
+    <RootNamespace>ManaBarrierMod</RootNamespace>
+    <ModDeploymentDirectory>C:\ACE\Mods\$(MSBuildProjectName)</ModDeploymentDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Lib.Harmony" Version="2.4.2" />
+    <ProjectReference Include="..\..\ACE\Source\ACE.Server\ACE.Server.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="Meta.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <NuGetAuditSuppress Include="https://github.com/advisories/GHSA-4f7c-pmjv-c25w" />
+  </ItemGroup>
+
+  <Target Name="DeployManaBarrierMod" AfterTargets="Build">
+    <MakeDir Directories="$(ModDeploymentDirectory)" />
+    <Copy
+      SourceFiles="$(TargetPath);$(ProjectDir)Meta.json"
+      DestinationFiles="$(ModDeploymentDirectory)\$(TargetFileName);$(ModDeploymentDirectory)\Meta.json"
+      SkipUnchangedFiles="true" />
+    <Message Importance="High" Text="Deployed $(TargetFileName) and Meta.json to $(ModDeploymentDirectory)" />
+  </Target>
+
+</Project>
